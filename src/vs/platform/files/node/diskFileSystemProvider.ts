@@ -148,6 +148,8 @@ export class DiskFileSystemProvider extends Disposable implements IFileSystemPro
 		}
 	}
 
+	private mapHandleToPos: Map<number, number> = new Map();
+
 	private writeHandles: Set<number> = new Set();
 	private canFlush: boolean = true;
 
@@ -192,6 +194,11 @@ export class DiskFileSystemProvider extends Disposable implements IFileSystemPro
 				this.writeHandles.add(handle);
 			}
 
+			// remember this handle to track file position of the handle
+			// we init the position to 0 assuming that read/write operations
+			// start from the beginning.
+			this.mapHandleToPos.set(handle, 0);
+
 			return handle;
 		} catch (error) {
 			throw this.toFileSystemProviderError(error);
@@ -200,6 +207,10 @@ export class DiskFileSystemProvider extends Disposable implements IFileSystemPro
 
 	async close(fd: number): Promise<void> {
 		try {
+
+			// remove this handle from map of positions
+			this.mapHandleToPos.delete(fd);
+
 			// if a handle is closed that was used for writing, ensure
 			// to flush the contents to disk if possible.
 			if (this.writeHandles.delete(fd) && this.canFlush) {
@@ -220,15 +231,66 @@ export class DiskFileSystemProvider extends Disposable implements IFileSystemPro
 	}
 
 	async read(fd: number, pos: number, data: Uint8Array, offset: number, length: number): Promise<number> {
+		const actualPos = this.resolvePos(fd, pos);
+
+		let bytesRead: number | null = null;
 		try {
-			const result = await promisify(read)(fd, data, offset, length, pos);
+			const result = await promisify(read)(fd, data, offset, length, actualPos);
+
 			if (typeof result === 'number') {
-				return result; // node.d.ts fail
+				bytesRead = result; // node.d.ts fail
+			} else {
+				bytesRead = result.bytesRead;
 			}
 
-			return result.bytesRead;
+			return bytesRead;
 		} catch (error) {
 			throw this.toFileSystemProviderError(error);
+		} finally {
+			this.updatePos(fd, actualPos, bytesRead);
+		}
+	}
+
+	private resolvePos(fd: number, pos: number): number | null {
+
+		// when calling fs.read/write we try to avoid passing in the "pos" argument and
+		// rather prefer to pass in "null" because this avoids an extra seek(pos)
+		// call that in some cases can even fail (e.g. when opening a file over FTP -
+		// see https://github.com/microsoft/vscode/issues/73884).
+		//
+		// as such, we compare the passed in position argument with our last known
+		// position for the file descriptor and use "null" if they match.
+		if (pos === this.mapHandleToPos.get(fd)) {
+			return null;
+		}
+
+		return pos;
+	}
+
+	private updatePos(fd: number, pos: number | null, bytesLength: number | null): void {
+		const lastKnownPos = this.mapHandleToPos.get(fd);
+		if (typeof lastKnownPos === 'number') {
+
+			// pos !== null signals that previously a position was used that is
+			// not null. node.js documentation explains, that in this case
+			// the internal file pointer is not moving and as such we do not move
+			// our position pointer.
+			if (typeof pos === 'number') {
+				// do not modify the position
+			}
+
+			// bytesLength = number is a signal that the read/write operation was
+			// successful and as such we need to advance the position in the Map
+			else if (typeof bytesLength === 'number') {
+				this.mapHandleToPos.set(fd, lastKnownPos + bytesLength);
+			}
+
+			// bytesLength = null signals an error in the read/write operation
+			// and as such we drop the handle from the Map because the position
+			// is unspecificed at this point.
+			else {
+				this.mapHandleToPos.delete(fd);
+			}
 		}
 	}
 
@@ -240,15 +302,23 @@ export class DiskFileSystemProvider extends Disposable implements IFileSystemPro
 	}
 
 	private async doWrite(fd: number, pos: number, data: Uint8Array, offset: number, length: number): Promise<number> {
+		const actualPos = this.resolvePos(fd, pos);
+
+		let bytesWritten: number | null = null;
 		try {
-			const result = await promisify(write)(fd, data, offset, length, pos);
+			const result = await promisify(write)(fd, data, offset, length, actualPos);
+
 			if (typeof result === 'number') {
-				return result; // node.d.ts fail
+				bytesWritten = result; // node.d.ts fail
+			} else {
+				bytesWritten = result.bytesWritten;
 			}
 
-			return result.bytesWritten;
+			return bytesWritten;
 		} catch (error) {
 			throw this.toFileSystemProviderError(error);
+		} finally {
+			this.updatePos(fd, actualPos, bytesWritten);
 		}
 	}
 
